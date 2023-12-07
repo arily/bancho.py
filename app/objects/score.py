@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 
 BEATMAPS_PATH = Path.cwd() / ".data/osu"
 
-
 @unique
 class Grade(IntEnum):
     # NOTE: these are implemented in the opposite order
@@ -451,3 +450,4 @@ class Score:
             "WHERE id = :user_id AND mode = :mode",
             {"user_id": self.player.id, "mode": self.mode},
         )
+    
