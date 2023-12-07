@@ -69,6 +69,9 @@ async def api_get_beatmaps(**params: Any) -> BeatmapApiResponse:
     return {"data": None, "status_code": response.status_code}
 
 
+KNOWN_BAD_FILES_MD5 = [
+    "d41d8cd98f00b204e9800998ecf8427e" # empty file 
+]
 async def ensure_local_osu_file(
     osu_file_path: Path,
     bmap_id: int,
@@ -76,25 +79,34 @@ async def ensure_local_osu_file(
 ) -> bool:
     """Ensure we have the latest .osu file locally,
     downloading it from the osu!api if required."""
-    if (
-        not osu_file_path.exists()
-        or hashlib.md5(osu_file_path.read_bytes()).hexdigest() != bmap_md5
-    ):
-        # need to get the file from the osu!api
-        if app.settings.DEBUG:
-            log(f"Doing osu!api (.osu file) request {bmap_id}", Ansi.LMAGENTA)
 
-        url = f"https://old.ppy.sh/osu/{bmap_id}"
-        response = await app.state.services.http_client.get(url)
-        if response.status_code != 200:
-            if 400 <= response.status_code < 500:
-                # client error, report this to cmyui
-                stacktrace = app.utils.get_appropriate_stacktrace()
-                await app.state.services.log_strange_occurrence(stacktrace)
-            return False
+    exists = osu_file_path.exists()
+    # some callers have type Any | str on "bmap_md5" so I assume it's optional, thus May be None.
+    # I use a magic string here to avoid letting optional md5 slip through.
+    file_md5 = hashlib.md5(osu_file_path.read_bytes()).hexdigest() if exists else "MAGIC_STRING__NOT_EXISTS"
+    if (file_md5 == bmap_md5):
+        return True
+    # need to get the file from the osu!api
+    if app.settings.DEBUG:
+        log(f"Doing osu!api (.osu file) request {bmap_id}", Ansi.LMAGENTA)
 
-        osu_file_path.write_bytes(response.read())
-
+    url = f"https://old.ppy.sh/osu/{bmap_id}"
+    resp = await app.state.services.http_client.get(url)
+    if resp.status_code != 200:
+        if 400 <= resp.status_code < 500:
+            # client error, report this to cmyui
+            stacktrace = app.utils.get_appropriate_stacktrace()
+            await app.state.services.log_strange_occurrence(stacktrace)
+        return False
+    b_beatmap = resp.read()
+    bytes_md5 = hashlib.md5(b_beatmap).hexdigest()
+    if (bytes_md5 in KNOWN_BAD_FILES_MD5): 
+        return False
+    # at least this' not a known bad file
+    osu_file_path.write_bytes(b_beatmap)
+    # some callers have type Any | str on "bmap_md5" so I assume it's optional
+    if (bmap_md5 and bytes_md5 != bmap_md5):
+        return False
     return True
 
 
