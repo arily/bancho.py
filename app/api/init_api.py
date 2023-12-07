@@ -124,6 +124,7 @@ def init_events(asgi_app: BanchoAPI) -> None:
             )
 
         await app.state.services.database.connect()
+        await app.state.services.create_db_and_tables() # for sqlalchemy orm
         await app.state.services.redis.initialize()
 
         if app.state.services.datadog is not None:

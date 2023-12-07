@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import ipaddress
 import pickle
 import re
@@ -8,10 +10,12 @@ from collections.abc import AsyncGenerator
 from collections.abc import Mapping
 from collections.abc import MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, AsyncContextManager, Optional
 from typing import TypedDict
 
 import databases
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
 import datadog as datadog_module
 import datadog.threadstats.base as datadog_client
 import httpx
@@ -40,7 +44,12 @@ SQL_UPDATES_FILE = Path.cwd() / "migrations/migrations.sql"
 
 http_client = httpx.AsyncClient()
 database = databases.Database(app.settings.DB_DSN)
-redis: aioredis.Redis = aioredis.from_url(app.settings.REDIS_DSN)
+
+_sqla_engine = create_async_engine(app.settings.DB_DSN_ASYNC, future=True)
+_async_session_maker = sessionmaker(_sqla_engine, class_=AsyncSession, expire_on_commit=False)
+orm_base = declarative_base()
+
+redis: aioredis.Redis = aioredis.from_url(app.settings.REDIS_DSN, decode_responses=True)
 
 datadog: datadog_client.ThreadStats | None = None
 if str(app.settings.DATADOG_API_KEY) and str(app.settings.DATADOG_APP_KEY):
@@ -103,6 +112,18 @@ country_codes = {
 }
 # fmt: on
 
+async def create_db_and_tables():
+    async with _sqla_engine.begin() as conn:
+        from app.repositories.addition.scores_foreign import ScoresForeign
+        from app.repositories.addition.scores_suspicion import ScoresSuspicion
+        from app.repositories.addition.username_history import UsernameHistory
+        await conn.run_sync(orm_base.metadata.create_all)
+
+@contextlib.asynccontextmanager
+async def db_session() -> AsyncContextManager[AsyncSession]:
+    async with _async_session_maker() as session:
+        yield session
+        await session.commit()
 
 class IPResolver:
     def __init__(self) -> None:

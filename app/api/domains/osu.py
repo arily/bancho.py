@@ -1,5 +1,6 @@
 """ osu: handle connections from web, api, and beyond? """
 from __future__ import annotations
+import asyncio
 
 import copy
 import hashlib
@@ -67,7 +68,7 @@ from app.repositories import players as players_repo
 from app.repositories import scores as scores_repo
 from app.repositories import stats as stats_repo
 from app.repositories.achievements import Achievement
-from app.usecases import achievements as achievements_usecases
+from app.usecases import achievements as achievements_usecases, anticheat
 from app.usecases import user_achievements as user_achievements_usecases
 from app.utils import escape_enum
 from app.utils import pymysql_encode
@@ -650,7 +651,7 @@ async def osuSubmitModularSelector(
     # through but ac'd if not found?
     # TODO: validate token format
     # TODO: save token in the database
-    token: str | None = Header(None), # ppysb feature: none when using ppysb client
+    token: str | None = Header(None),  # ppysb feature: none when using ppysb client
     # TODO: do ft & st contain pauses?
     exited_out: bool = Form(..., alias="x"),
     fail_time: int = Form(..., alias="ft"),
@@ -720,62 +721,9 @@ async def osuSubmitModularSelector(
 
     ## perform checksum validation
 
-    unique_id1, unique_id2 = unique_ids.split("|", maxsplit=1)
-    unique_id1_md5 = hashlib.md5(unique_id1.encode()).hexdigest()
-    unique_id2_md5 = hashlib.md5(unique_id2.encode()).hexdigest()
-
-    try:
-        assert player.client_details is not None
-        
-        bypass_client_check = player.client_details.osu_version.stream == OsuStream.PPYSB # ppysb feature
-        
-        if not bypass_client_check:
-            
-            if osu_version != f"{player.client_details.osu_version.date:%Y%m%d}":
-                raise ValueError("osu! version mismatch")
-
-            if client_hash_decoded != player.client_details.client_hash:
-                raise ValueError("client hash mismatch")
-            # assert unique ids (c1) are correct and match login params
-            if unique_id1_md5 != player.client_details.uninstall_md5:
-                raise ValueError(
-                    f"unique_id1 mismatch ({unique_id1_md5} != {player.client_details.uninstall_md5})",
-                )
-
-            if unique_id2_md5 != player.client_details.disk_signature_md5:
-                raise ValueError(
-                    f"unique_id2 mismatch ({unique_id2_md5} != {player.client_details.disk_signature_md5})",
-                )
-
-            # assert online checksums match
-            server_score_checksum = score.compute_online_checksum(
-                osu_version=osu_version,
-                osu_client_hash=client_hash_decoded,
-                storyboard_checksum=storyboard_md5 or "",
-            )
-            if score.client_checksum != server_score_checksum:
-                raise ValueError(
-                    f"online score checksum mismatch ({server_score_checksum} != {score.client_checksum})",
-                )
-
-            # assert beatmap hashes match
-            if bmap_md5 != updated_beatmap_hash:
-                raise ValueError(
-                    f"beatmap hash mismatch ({bmap_md5} != {updated_beatmap_hash})",
-                )
-                
-    except (ValueError, AssertionError) as error:
-        if error.args.count == 1:
-            await player.restrict(
-                admin=app.state.sessions.bot,
-                reason=error.args[0],
-            )
-
-            # refresh their client state
-            if player.online:
-                player.logout()
-
-            return b"error: ban"
+    asyncio.ensure_future(
+        anticheat.validate_checksum(unique_ids, osu_version, client_hash_decoded, storyboard_md5, bmap_md5, updated_beatmap_hash, player, score)
+    )
 
     # we should update their activity no matter
     # what the result of the score submission is.
@@ -969,6 +917,9 @@ async def osuSubmitModularSelector(
                 )
                 if score.player.is_online:
                     score.player.logout()
+
+        # suspect the score after the replay file written
+        asyncio.ensure_future(anticheat.check_suspicion(player, score))
 
     """ Update the user's & beatmap's stats """
 
@@ -1501,14 +1452,14 @@ async def getScores(
 
     if app.state.services.datadog:
         app.state.services.datadog.increment("bancho.leaderboards_served")
-        
+
     ### ppysb feature begin
 
     # if bmap.status < RankedStatus.Ranked:
-        # only show leaderboards for ranked,
-        # approved, qualified, or loved maps.
-        # return f"{int(bmap.status)}|false".encode()
-        
+    # only show leaderboards for ranked,
+    # approved, qualified, or loved maps.
+    # return f"{int(bmap.status)}|false".encode()
+
     ### ppysb feature end
 
     # fetch scores & personal best
@@ -1532,9 +1483,9 @@ async def getScores(
         rating = 0.0
 
     ## construct response for osu! client
-    
+
     ### ppysb feature begin
-    
+
     response_status = bmap.status
     if bmap.status < RankedStatus.Ranked:
         response_status = RankedStatus.Approved
@@ -1547,7 +1498,7 @@ async def getScores(
         # TODO: server side beatmap offsets
         f"0\n{bmap.full_name}\n{rating}",
     ]
-    
+
     ### ppysb feature end
 
     if not score_rows:
@@ -1769,13 +1720,13 @@ async def get_screenshot(
         path=screenshot_path,
         media_type=app.utils.get_media_type(extension),
     )
-    
+
+
 geo_cache: dict = {}
-    
+
+
 async def get_osz_url(
-    headers: Mapping[str, str],
-    beatmapset_id: str,
-    no_video: bool
+    headers: Mapping[str, str], beatmapset_id: str, no_video: bool
 ) -> str:
     ip_address = app.state.services.ip_resolver.get_ip(headers)
     geo_country = geo_cache.get(ip_address)
@@ -1789,7 +1740,6 @@ async def get_osz_url(
         return f"https://dl.sayobot.cn/beatmaps/download/{prefix}/{beatmapset_id}"
     query_str = f"{beatmapset_id}?n={int(not no_video)}"
     return f"{app.settings.MIRROR_DOWNLOAD_ENDPOINT}/{query_str}"
-    
 
 
 @router.get("/d/{map_set_id}")
