@@ -16,8 +16,8 @@ from typing import Any
 from typing import TypeVar
 
 import databases
-from akatsuki_pp_py import Beatmap
-from akatsuki_pp_py import Calculator
+from rosu_pp_py import Beatmap
+from rosu_pp_py import Calculator
 from redis import asyncio as aioredis
 
 sys.path.insert(0, os.path.abspath(os.pardir))
@@ -28,6 +28,7 @@ try:
     from app.constants.mods import Mods
     from app.constants.gamemodes import GameMode
     from app.objects.beatmap import ensure_local_osu_file
+    from app.objects.score import Score
     import app.settings
     import app.state.services
 except ModuleNotFoundError:
@@ -58,35 +59,48 @@ async def recalculate_score(
     beatmap_path: Path,
     ctx: Context,
 ) -> None:
-    beatmap = ctx.beatmaps.get(score["map_id"])
-    if beatmap is None:
-        beatmap = Beatmap(path=str(beatmap_path))
-        ctx.beatmaps[score["map_id"]] = beatmap
+    try:
+        beatmap = ctx.beatmaps.get(score["map_id"])
+        if beatmap is None:
+            beatmap = Beatmap(path=str(beatmap_path))
+            ctx.beatmaps[score["map_id"]] = beatmap
+            
+        score_obj = Score()
+        score_obj.mode = GameMode(score["mode"])
+        score_obj.n300 = score["n300"]
+        score_obj.n100 = score["n100"]
+        score_obj.n50 = score["n50"]
+        score_obj.nmiss = score["nmiss"]
+        score_obj.ngeki = score["ngeki"]
+        score_obj.nkatu = score["nkatu"]
+        new_accuracy = score_obj.calculate_accuracy()
 
-    calculator = Calculator(
-        mode=GameMode(score["mode"]).as_vanilla,
-        mods=score["mods"],
-        acc=score["acc"],
-        combo=score["max_combo"],
-        n_geki=score["ngeki"],  # Mania 320s
-        n300=score["n300"],
-        n_katu=score["nkatu"],  # Mania 200s, Catch tiny droplets
-        n100=score["n100"],
-        n50=score["n50"],
-        n_misses=score["nmiss"],
-    )
-    attrs = calculator.performance(beatmap)
+        calculator = Calculator(
+            mode=GameMode(score["mode"]).as_vanilla,
+            mods=score["mods"],
+            acc=new_accuracy,
+            combo=score["max_combo"],
+            n_geki=score["ngeki"],  # Mania 320s
+            n300=score["n300"],
+            n_katu=score["nkatu"],  # Mania 200s, Catch tiny droplets
+            n100=score["n100"],
+            n50=score["n50"],
+            n_misses=score["nmiss"],
+        )
+        attrs = calculator.performance(beatmap)
 
-    new_pp: float = attrs.pp
-    if math.isnan(new_pp) or math.isinf(new_pp):
-        new_pp = 0.0
+        new_pp: float = attrs.pp
+        if math.isnan(new_pp) or math.isinf(new_pp):
+            new_pp = 0.0
 
-    new_pp = min(new_pp, 9999.999)
+        new_pp = min(new_pp, 9999.999)
 
-    await ctx.database.execute(
-        "UPDATE scores SET pp = :new_pp WHERE id = :id",
-        {"new_pp": new_pp, "id": score["id"]},
-    )
+        await ctx.database.execute(
+            "UPDATE scores SET pp = :new_pp, acc = :new_acc WHERE id = :id",
+            {"new_pp": new_pp, "new_acc": new_accuracy, "id": score["id"]},
+        )
+    except Exception:
+        return
 
     if DEBUG:
         print(
@@ -106,7 +120,7 @@ async def process_score_chunk(
         tasks.append(recalculate_score(score, beatmap_path, ctx))
 
     await asyncio.gather(*tasks)
-
+    
 
 async def recalculate_user(
     id: int,
@@ -124,6 +138,7 @@ async def recalculate_user(
 
     total_scores = len(best_scores)
     if not total_scores:
+        await ctx.database.execute(f"REPLACE INTO stats values ({id}, {int(game_mode)}, 0, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0, 0)")
         return
 
     top_100_pp = best_scores[:100]
@@ -137,11 +152,46 @@ async def recalculate_user(
     weighted_pp = sum(row["pp"] * 0.95**i for i, row in enumerate(top_100_pp))
     bonus_pp = 416.6667 * (1 - 0.9994**total_scores)
     pp = round(weighted_pp + bonus_pp)
-
-    await ctx.database.execute(
-        "UPDATE stats SET pp = :pp, acc = :acc WHERE id = :id AND mode = :mode",
-        {"pp": pp, "acc": acc, "id": id, "mode": game_mode},
+    
+    total_hits_sum = "n300 + n100 + n50"
+    if game_mode.as_vanilla in (1, 3):
+        total_hits_sum += " + ngeki + nkatu"
+    
+    scores_data_all = await ctx.database.fetch_one(
+        f"SELECT sum(score), count(id), sum(time_elapsed), sum({total_hits_sum}) FROM scores "
+        "WHERE userid = :user_id AND mode = :mode ",
+        {"user_id": id, "mode": game_mode},
     )
+    
+    scores_data_ranked = await ctx.database.fetch_one(
+        "SELECT sum(s.score), max(s.max_combo) FROM scores s "
+        "INNER JOIN maps m ON s.map_md5 = m.md5 "
+        "WHERE s.userid = :user_id AND s.mode = :mode "
+        "AND s.status = 2 AND m.status IN (2, 3)",  # ranked, approved
+        {"user_id": id, "mode": game_mode},
+    )
+    
+    scores_data_ranked_first = await ctx.database.fetch_one(
+        "SELECT count(grade='XH' or NULL), count(grade='X' or NULL), count(grade='SH' or NULL), count(grade='S' or NULL), count(grade='A' or NULL) FROM scores s "
+        "INNER JOIN maps m ON s.map_md5 = m.md5 "
+        "WHERE s.userid = :user_id AND s.mode = :mode "
+        "AND s.status = 2 AND m.status IN (2, 3) AND s.status=2",  # ranked, approved, first
+        {"user_id": id, "mode": game_mode},
+    )
+    
+    tscore = scores_data_all[0]
+    rscore = scores_data_ranked[0]
+    plays = scores_data_all[1]
+    playtime = int(scores_data_all[2] / 1000)
+    max_combo = scores_data_ranked[1]
+    total_hits = scores_data_all[3]
+    xh_count = scores_data_ranked_first[0]
+    x_count = scores_data_ranked_first[1]
+    sh_count = scores_data_ranked_first[2]
+    s_count = scores_data_ranked_first[3]
+    a_count = scores_data_ranked_first[4]
+    
+    await ctx.database.execute(f"REPLACE INTO stats values ({id}, {int(game_mode)}, {tscore}, {rscore}, {pp}, {plays}, {playtime}, {acc}, {max_combo}, {total_hits}, 0, {xh_count}, {x_count}, {sh_count}, {s_count}, {a_count})")
 
     user_info = await ctx.database.fetch_one(
         "SELECT country, priv FROM users WHERE id = :id",
@@ -182,8 +232,9 @@ async def recalculate_mode_users(mode: GameMode, ctx: Context) -> None:
         row["id"] for row in await ctx.database.fetch_all("SELECT id FROM users")
     ]
 
-    for id_chunk in divide_chunks(user_ids, 100):
+    for id_chunk in divide_chunks(user_ids, 10):
         await process_user_chunk(id_chunk, mode, ctx)
+        await asyncio.sleep(0.1)
 
 
 async def recalculate_mode_scores(mode: GameMode, ctx: Context) -> None:
@@ -221,13 +272,13 @@ async def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("-d", "--debug", action="store_true")
     parser.add_argument(
         "--scores",
-        description="Recalculate scores",
+        help="Recalculate scores",
         action="store_true",
         default=True,
     )
     parser.add_argument(
         "--stats",
-        description="Recalculate stats",
+        help="Recalculate stats",
         action="store_true",
         default=True,
     )
