@@ -651,7 +651,10 @@ class Player:
             return
 
         slot = self.match.get_slot(self)
-        assert slot is not None
+        # assert slot is not None
+        if slot is None:
+            log(f"{self} has no slot in his match, why?", Ansi.RED)
+            return
 
         if slot.status == SlotStatus.locked:
             # player was kicked, keep the slot locked.
