@@ -41,6 +41,12 @@ from app.usecases.performance import ScoreParams
 
 router = APIRouter(tags=["API ppy.sb"], prefix="/sb")
 http_bearer_scheme = HTTPBearer(auto_error=False)
+REPLAYS_PATH = Path.cwd() / ".data/osr"
+
+
+def replay_available(score_id: int) -> bool:
+    """Whether this server has a stored replay file for the score."""
+    return (REPLAYS_PATH / f"{score_id}.osr").is_file()
 
 
 @router.get("/user-scores")
@@ -116,6 +122,7 @@ async def user_best_scores(
             "perfect": bool(row["perfect"]),
             "playedAt": played_at,
             "checksum": row["online_checksum"],
+            "hasReplay": replay_available(row["id"]),
         }
 
     return ORJSONResponse({"scores": [serialize(row) for row in rows]})
@@ -197,6 +204,7 @@ async def map_best_scores(
                 "perfect": bool(row["perfect"]),
                 "playedAt": played_at,
                 "checksum": row["online_checksum"],
+                "hasReplay": replay_available(row["id"]),
                 "bindingKey": hmac_new(
                     settings.TRUSTED_SECRET.encode(),
                     row["binding_email"].strip().lower().encode(),
